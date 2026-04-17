@@ -47,9 +47,29 @@ class FittedModel:
     n_rows: int
     y_means: np.ndarray
     y_stds: np.ndarray
+    # Observed target values per row (shape (n_rows, n_targets)) with presence
+    # mask — used by BO to compute the true direction-aware incumbent.
+    Y_obs: np.ndarray
+    Y_mask: np.ndarray
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return self.estimator.predict_mean_std(X)
+
+    def observed_extremum(self, target: str, *, direction: str) -> float | None:
+        """Return direction-aware best observed value for a target, or None.
+
+        Ignores rows where the target was not measured.
+        """
+        if target not in self.target_names:
+            raise KeyError(target)
+        j = self.target_names.index(target)
+        if self.Y_mask.shape[0] == 0:
+            return None
+        keep = self.Y_mask[:, j] > 0.5
+        if not keep.any():
+            return None
+        vals = self.Y_obs[keep, j]
+        return float(vals.max()) if direction == "maximize" else float(vals.min())
 
 
 def fit_for_domain(
@@ -71,6 +91,8 @@ def fit_for_domain(
             n_rows=0,
             y_means=np.zeros(len(target_names)),
             y_stds=np.ones(len(target_names)),
+            Y_obs=np.zeros((0, len(target_names))),
+            Y_mask=np.zeros((0, len(target_names))),
         )
     est = select_estimator(n=X.shape[0], d=layout.dim)
     est.fit(X, Y, mask=Ym)
@@ -88,6 +110,8 @@ def fit_for_domain(
         n_rows=X.shape[0],
         y_means=y_means,
         y_stds=y_stds,
+        Y_obs=Y,
+        Y_mask=Ym,
     )
 
 

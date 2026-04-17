@@ -14,10 +14,12 @@ import pandas as pd
 import streamlit as st
 
 from ..design import Objective, suggest_experiments
-from ..models import fit_for_domain
+from ..featurize import build_matrices
+from ..models import cross_validate, fit_for_domain
 from ..schema import (
     CATEGORY_ORDER,
     Category,
+    Experiment,
     InputSpec,
     InputType,
     InputValue,
@@ -71,10 +73,14 @@ def _new_material_form(ws: Workspace) -> None:
         name = st.text_input("Material name", placeholder="e.g. NMC cathodes")
         n_inputs = st.number_input("# input columns", min_value=1, max_value=50, value=3)
         n_targets = st.number_input("# target columns", min_value=1, max_value=10, value=1)
-        st.caption("Declare each input (category + type drive featurization).")
+        st.caption(
+            "Each input carries a category (what it represents) and a type "
+            "(how it's stored/featurized). For numeric inputs give bounds; "
+            "for categorical give choices (comma-separated)."
+        )
         input_rows = []
         for i in range(int(n_inputs)):
-            cols = st.columns([2, 2, 2, 1])
+            cols = st.columns([2, 2, 2, 2])
             input_rows.append(
                 {
                     "name": cols[0].text_input(f"input #{i+1} name", key=f"in_n_{i}"),
@@ -88,8 +94,10 @@ def _new_material_form(ws: Workspace) -> None:
                         [t.value for t in InputType],
                         key=f"in_t_{i}",
                     ),
-                    "bounds": cols[3].text_input(
-                        f"input #{i+1} bounds (lo,hi)", key=f"in_b_{i}"
+                    "extra": cols[3].text_input(
+                        f"input #{i+1} bounds/choices",
+                        key=f"in_b_{i}",
+                        placeholder="lo,hi  or  a,b,c",
                     ),
                 }
             )
@@ -99,7 +107,7 @@ def _new_material_form(ws: Workspace) -> None:
             target_rows.append(
                 {
                     "name": cols[0].text_input(f"target #{j+1} name", key=f"tg_n_{j}"),
-                    "bounds": cols[1].text_input(
+                    "extra": cols[1].text_input(
                         f"target #{j+1} bounds (lo,hi)", key=f"tg_b_{j}"
                     ),
                 }
@@ -122,20 +130,27 @@ def _materialize_form(name: str, input_rows, target_rows) -> MaterialDomain:
     for r in input_rows:
         if not r["name"].strip():
             continue
-        bounds = _parse_bounds(r["bounds"])
+        t = InputType(r["type"])
+        bounds = None
+        choices = None
+        if t == InputType.NUMERIC:
+            bounds = _parse_bounds(r["extra"])
+        elif t == InputType.CATEGORICAL:
+            choices = _parse_choices(r["extra"])
         inputs.append(
             InputSpec(
                 name=r["name"].strip(),
                 category=Category(r["category"]),
-                type=InputType(r["type"]),
+                type=t,
                 bounds=bounds,
+                choices=choices,
             )
         )
     targets: list[InputSpec] = []
     for r in target_rows:
         if not r["name"].strip():
             continue
-        bounds = _parse_bounds(r["bounds"])
+        bounds = _parse_bounds(r["extra"])
         targets.append(
             InputSpec(
                 name=r["name"].strip(),
@@ -149,6 +164,13 @@ def _materialize_form(name: str, input_rows, target_rows) -> MaterialDomain:
     if not targets:
         raise ValueError("declare at least one target")
     return MaterialDomain(name=name.strip(), inputs=inputs, targets=targets)
+
+
+def _parse_choices(text: str) -> list[str] | None:
+    t = text.strip()
+    if not t:
+        return None
+    return [p.strip() for p in t.split(",") if p.strip()]
 
 
 def _parse_bounds(text: str) -> tuple[float, float] | None:
@@ -178,6 +200,9 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
     )
     st.markdown(legend)
 
+    with st.expander("Schema", expanded=False):
+        _schema_editor(ws, domain)
+
     experiments = list(ws.store.iter_experiments(material_name))
     df = experiments_to_frame(domain, experiments)
 
@@ -203,8 +228,8 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
         use_container_width=True,
     )
 
-    save_col, clear_col, _ = st.columns([1, 1, 4])
-    if save_col.button("Save sheet"):
+    save_col, reload_col, import_col, export_col = st.columns([1, 1, 2, 1])
+    if save_col.button("Save sheet", key=f"save_{material_name}"):
         try:
             exps = frame_to_experiments(domain, edited)
             for exp in exps:
@@ -215,13 +240,222 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
         except Exception as exc:
             st.error(f"{exc}")
 
-    if clear_col.button("Reload from store"):
+    if reload_col.button("Reload", key=f"reload_{material_name}"):
         st.rerun()
 
+    with import_col.expander("Import CSV"):
+        uploaded = st.file_uploader(
+            "CSV with columns matching this material",
+            type=["csv"],
+            key=f"csv_{material_name}",
+            label_visibility="collapsed",
+        )
+        if uploaded is not None:
+            try:
+                new_df = pd.read_csv(uploaded)
+                exps = frame_to_experiments(domain, new_df)
+                for exp in exps:
+                    exp.validate_against(domain)
+                    ws.store.upsert(exp)
+                st.success(f"Imported {len(exps)} row(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"{exc}")
+
+    export_col.download_button(
+        "Export CSV",
+        data=df.to_csv(index=False).encode(),
+        file_name=f"{material_name}.csv",
+        mime="text/csv",
+        key=f"export_{material_name}",
+    )
+
+    st.divider()
+    _model_quality_section(ws, domain)
     st.divider()
     _predict_section(ws, domain)
     st.divider()
     _suggest_section(ws, domain)
+    st.divider()
+    _coverage_section(ws, domain)
+
+
+def _schema_editor(ws: Workspace, domain: MaterialDomain) -> None:
+    st.caption("Declared columns for this material.")
+    rows = [
+        {
+            "name": s.name,
+            "role": "target" if s.category == Category.TARGET else "input",
+            "category": s.category.value,
+            "type": s.type.value,
+            "unit": s.unit or "",
+            "bounds": (
+                f"{s.bounds[0]}, {s.bounds[1]}" if s.bounds else ""
+            ),
+            "choices": ", ".join(s.choices) if s.choices else "",
+        }
+        for s in domain.all_specs()
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("**Add a column**")
+    with st.form(f"add_col_{domain.name}"):
+        cols = st.columns([2, 1, 2, 2, 2])
+        new_name = cols[0].text_input("name", key=f"add_n_{domain.name}")
+        role = cols[1].selectbox("role", ["input", "target"], key=f"add_r_{domain.name}")
+        cat = cols[2].selectbox(
+            "category",
+            [c.value for c in CATEGORY_ORDER if c != Category.TARGET],
+            key=f"add_c_{domain.name}",
+        )
+        t = cols[3].selectbox(
+            "type", [t.value for t in InputType], key=f"add_t_{domain.name}"
+        )
+        extra = cols[4].text_input(
+            "bounds (lo,hi) or choices (a,b,c)", key=f"add_e_{domain.name}"
+        )
+        if st.form_submit_button("Add column"):
+            try:
+                typ = InputType(t)
+                bounds = None
+                choices = None
+                if role == "target":
+                    typ = InputType.NUMERIC
+                    category = Category.TARGET
+                    bounds = _parse_bounds(extra)
+                else:
+                    category = Category(cat)
+                    if typ == InputType.NUMERIC:
+                        bounds = _parse_bounds(extra)
+                    elif typ == InputType.CATEGORICAL:
+                        choices = _parse_choices(extra)
+                spec = InputSpec(
+                    name=new_name.strip(),
+                    category=category,
+                    type=typ,
+                    bounds=bounds,
+                    choices=choices,
+                )
+                new_inputs = list(domain.inputs)
+                new_targets = list(domain.targets)
+                if role == "target":
+                    new_targets.append(spec)
+                else:
+                    new_inputs.append(spec)
+                updated = MaterialDomain(
+                    name=domain.name,
+                    description=domain.description,
+                    inputs=new_inputs,
+                    targets=new_targets,
+                )
+                ws.registry.add_material(updated, overwrite=True)
+                st.success(f"Added column {spec.name!r}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"{exc}")
+
+    danger = st.expander("Danger zone")
+    with danger:
+        confirm = st.text_input(
+            f"Type '{domain.name}' to delete this material and ALL its experiments",
+            key=f"del_conf_{domain.name}",
+        )
+        if st.button(
+            "Delete material",
+            key=f"del_btn_{domain.name}",
+            disabled=confirm != domain.name,
+        ):
+            for exp in list(ws.store.iter_experiments(domain.name)):
+                ws.store.delete(domain.name, exp.id)
+            ws.registry.delete(domain.name)
+            st.success(f"Deleted {domain.name!r}")
+            st.rerun()
+
+
+def _model_quality_section(ws: Workspace, domain: MaterialDomain) -> None:
+    st.subheader("Model quality")
+    st.caption(
+        "Leave-one-out (n ≤ 25) or 5-fold (larger) cross-validation. "
+        "MSE compared against the mean predictor."
+    )
+    exps = list(ws.store.iter_experiments(domain.name))
+    if len(exps) < 5:
+        st.info(
+            f"{len(exps)} rows — need at least 5 for cross-validation."
+        )
+        return
+    with st.spinner("Scoring folds…"):
+        report = cross_validate(domain, exps)
+    if report is None:
+        st.info("Cross-validation unavailable.")
+        return
+    rows = []
+    for j, t in enumerate(report.target_names):
+        imp = report.improvement_pct(t)
+        rows.append(
+            {
+                "target": t,
+                "MSE (model)": float(report.mse_model[j]),
+                "MSE (mean baseline)": float(report.mse_baseline[j]),
+                "R² (model)": float(report.r2_model[j]),
+                "improvement vs baseline": f"{imp:+.1f}%",
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.caption(f"{report.n_folds} folds • {report.n_rows} rows")
+
+
+def _coverage_section(ws: Workspace, domain: MaterialDomain) -> None:
+    st.subheader("Design coverage")
+    st.caption(
+        "2-D PCA of the feature vectors, colored by target. Shows where you "
+        "already have data and where the design space is unexplored."
+    )
+    exps = list(ws.store.iter_experiments(domain.name))
+    if len(exps) < 3:
+        st.info(f"{len(exps)} rows — need at least 3 to project.")
+        return
+    from sklearn.decomposition import PCA
+
+    X, _, _ = build_matrices(domain, exps)
+    if X.shape[1] < 2:
+        st.info("Need at least 2 feature dimensions to project.")
+        return
+    pca = PCA(n_components=2, random_state=0)
+    try:
+        Z = pca.fit_transform(X)
+    except Exception as exc:  # pragma: no cover
+        st.error(f"PCA failed: {exc}")
+        return
+    target = st.selectbox(
+        "Color by target",
+        [t.name for t in domain.targets],
+        key=f"cov_{domain.name}",
+    )
+    y = []
+    for e in exps:
+        iv = e.values.get(target)
+        y.append(float(iv.value) if iv is not None else None)
+    plot_df = pd.DataFrame(
+        {
+            "PC1": Z[:, 0],
+            "PC2": Z[:, 1],
+            target: y,
+            "id": [e.id for e in exps],
+        }
+    )
+    st.scatter_chart(
+        plot_df,
+        x="PC1",
+        y="PC2",
+        color=target,
+        size=None,
+        use_container_width=True,
+    )
+    ev = pca.explained_variance_ratio_
+    st.caption(
+        f"PC1 explains {ev[0]*100:.1f}%, PC2 {ev[1]*100:.1f}% of feature variance."
+    )
 
 
 def _predict_section(ws: Workspace, domain: MaterialDomain) -> None:
@@ -243,9 +477,6 @@ def _predict_section(ws: Workspace, domain: MaterialDomain) -> None:
     if st.button("Predict", key=f"predict_btn_{domain.name}"):
         try:
             fitted = fit_for_domain(domain, ws.store.iter_experiments(domain.name))
-            from ..featurize import build_matrices
-            from ..schema import Experiment
-
             probe = Experiment(id="__probe", domain=domain.name, values=values)
             X, _, _ = build_matrices(domain, [probe])
             mean, std = fitted.predict(X)

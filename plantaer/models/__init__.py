@@ -13,6 +13,7 @@ from .base import Estimator, MeanBaseline
 from .gp import SklearnGP
 from .gbm import BootstrapGBM
 from .selector import select_estimator, fit_for_domain, FittedModel
+from .cv import CVReport, cross_validate
 
 __all__ = [
     "Estimator",
@@ -22,4 +23,6 @@ __all__ = [
     "select_estimator",
     "fit_for_domain",
     "FittedModel",
+    "CVReport",
+    "cross_validate",
 ]

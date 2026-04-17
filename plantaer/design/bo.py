@@ -129,12 +129,13 @@ def suggest_experiments(
     m = mean[:, tidx]
     s = std[:, tidx]
 
-    # "Best so far" uses the training mean vector as the incumbent — for
-    # v1 we treat the best observed point as the direction-wise max/min of
-    # predicted values over training, which we don't have here. Use the
-    # training mean + direction*std as a mildly conservative incumbent.
-    incumbent = float(fitted.y_means[tidx] + objective.sign() * fitted.y_stds[tidx])
-    ei = _ei(m, s, best=incumbent, sign=objective.sign())
+    # EI uses the true direction-aware extremum of observed targets as the
+    # incumbent — the standard definition. Falls back to the training mean
+    # only if no target was ever measured (shouldn't happen post-selector).
+    incumbent = fitted.observed_extremum(objective.target, direction=objective.direction)
+    if incumbent is None:
+        incumbent = float(fitted.y_means[tidx])
+    ei = _ei(m, s, best=float(incumbent), sign=objective.sign())
 
     top = np.argsort(-ei)[:n_suggestions]
     return [
