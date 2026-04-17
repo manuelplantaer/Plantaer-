@@ -150,6 +150,53 @@ def test_rename_experiment_rejects_collision(ws):
 
 
 # ---------------------------------------------------------------------------
+# Delete material
+# ---------------------------------------------------------------------------
+
+
+def test_delete_material_removes_registry_and_rows(ws):
+    removed = ws.delete_material("Alpha")
+    assert removed == 5
+    assert ws.registry.list_materials() == []
+    assert ws.store.count("Alpha") == 0
+
+
+def test_delete_material_unknown_is_noop(ws):
+    removed = ws.delete_material("no-such-material")
+    assert removed == 0
+    # Existing material untouched.
+    assert ws.store.count("Alpha") == 5
+
+
+def test_delete_material_leaves_other_materials_alone(ws):
+    other = MaterialDomain(
+        name="Beta",
+        inputs=[
+            InputSpec(
+                name="x",
+                category=Category.PROCESSING,
+                type=InputType.NUMERIC,
+                bounds=(0.0, 1.0),
+            )
+        ],
+        targets=[
+            InputSpec(name="y", category=Category.TARGET, type=InputType.NUMERIC)
+        ],
+    )
+    ws.registry.add_material(other)
+    ws.store.upsert(
+        Experiment(
+            id="b0",
+            domain="Beta",
+            values={"x": InputValue(value=0.5), "y": InputValue(value=1.0)},
+        )
+    )
+    ws.delete_material("Alpha")
+    assert ws.registry.list_materials() == ["Beta"]
+    assert ws.store.count("Beta") == 1
+
+
+# ---------------------------------------------------------------------------
 # Lock / unlock semantics
 # ---------------------------------------------------------------------------
 

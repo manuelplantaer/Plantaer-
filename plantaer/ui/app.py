@@ -78,12 +78,81 @@ def _sidebar(ws: Workspace) -> str | None:
             ):
                 st.session_state["material_picker"] = name
                 st.rerun()
+            if is_active:
+                _sidebar_material_actions(ws, name)
     else:
         st.sidebar.info("No materials registered yet.")
 
     with st.sidebar.expander("+ New material", expanded=not materials):
         _new_material_form(ws)
     return st.session_state.get("material_picker")
+
+
+def _sidebar_material_actions(ws: Workspace, name: str) -> None:
+    """Inline rename / delete controls under the active material."""
+    rn_open_key = f"rn_open_{name}"
+    del_open_key = f"del_open_{name}"
+    col_rn, col_del = st.sidebar.columns(2)
+    if col_rn.button("✏️ Rename", key=f"rn_toggle_{name}", use_container_width=True):
+        st.session_state[rn_open_key] = not st.session_state.get(rn_open_key, False)
+        st.session_state[del_open_key] = False
+    if col_del.button("🗑️ Delete", key=f"del_toggle_{name}", use_container_width=True):
+        st.session_state[del_open_key] = not st.session_state.get(del_open_key, False)
+        st.session_state[rn_open_key] = False
+
+    if st.session_state.get(rn_open_key, False):
+        new_name = st.sidebar.text_input(
+            "new name",
+            value=name,
+            key=f"rn_val_{name}",
+            label_visibility="collapsed",
+        )
+        ok, cancel = st.sidebar.columns(2)
+        if ok.button(
+            "Save rename",
+            key=f"rn_ok_{name}",
+            use_container_width=True,
+            type="primary",
+        ):
+            try:
+                ws.rename_material(name, new_name)
+                st.session_state["material_picker"] = new_name.strip()
+                st.session_state[rn_open_key] = False
+                st.toast(f"✓ Renamed to {new_name.strip()!r}")
+                st.rerun()
+            except Exception as exc:
+                st.sidebar.error(f"{exc}")
+        if cancel.button("Cancel", key=f"rn_cancel_{name}", use_container_width=True):
+            st.session_state[rn_open_key] = False
+            st.rerun()
+
+    if st.session_state.get(del_open_key, False):
+        st.sidebar.warning(
+            f"This deletes **{name}** AND every experiment under it. "
+            "Type the material name to confirm."
+        )
+        conf = st.sidebar.text_input(
+            "confirm name",
+            key=f"del_conf_{name}",
+            label_visibility="collapsed",
+            placeholder=name,
+        )
+        ok, cancel = st.sidebar.columns(2)
+        if ok.button(
+            "Delete forever",
+            key=f"del_ok_{name}",
+            use_container_width=True,
+            type="primary",
+            disabled=conf != name,
+        ):
+            removed = ws.delete_material(name)
+            st.session_state.pop("material_picker", None)
+            st.session_state[del_open_key] = False
+            st.toast(f"✓ Deleted {name!r} ({removed} rows)")
+            st.rerun()
+        if cancel.button("Cancel", key=f"del_cancel_{name}", use_container_width=True):
+            st.session_state[del_open_key] = False
+            st.rerun()
 
 
 def _new_material_form(ws: Workspace) -> None:

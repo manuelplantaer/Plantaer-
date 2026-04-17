@@ -102,6 +102,22 @@ class Workspace:
             )
             self.store.upsert(migrated)
 
+    def delete_material(self, name: str) -> int:
+        """Remove a material and every experiment belonging to it.
+
+        Returns the number of experiment rows deleted. Unknown materials are
+        a no-op (returns 0) rather than raising — the UI uses this path after
+        a confirmation step so idempotence is the safer contract.
+        """
+        if name not in self.registry.list_materials():
+            return 0
+        removed = 0
+        for exp in list(self.store.iter_experiments(name)):
+            self.store.delete(name, exp.id)
+            removed += 1
+        self.registry.delete(name)
+        return removed
+
     def rename_experiment(
         self, material_name: str, old_id: str, new_id: str
     ) -> None:
