@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plantaer"
+version = "0.1.0"
+description = "Plantaer materials-science foundation-model MVP: ingest experiments, predict properties, suggest next experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.5",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "xgboost>=2.0",
+    "botorch>=0.10",
+    "gpytorch>=1.11",
+    "torch>=2.1",
+    "matminer>=0.9",
+    "pymatgen>=2024.1",
+    "streamlit>=1.31",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+[project.optional-dependencies]
+structure = ["matgl>=1.0"]
+molecule = ["rdkit>=2023.9"]
+search = ["faiss-cpu>=1.7"]
+test = ["pytest>=8.0", "pytest-cov>=4.1"]
+
+[tool.setuptools.packages.find]
+include = ["plantaer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
