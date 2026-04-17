@@ -57,15 +57,33 @@ def _sidebar(ws: Workspace) -> str | None:
     st.sidebar.title("Plantaer")
     st.sidebar.caption(f"workspace: `{ws.root}`")
     materials = ws.registry.list_materials()
+
+    sel = st.session_state.get("material_picker")
+    if sel not in materials:
+        sel = materials[0] if materials else None
+        st.session_state["material_picker"] = sel
+
     if materials:
-        sel = st.sidebar.selectbox("Material", materials, key="material_picker")
+        st.sidebar.markdown("**Materials**")
+        for name in materials:
+            count = ws.store.count(name)
+            is_active = name == sel
+            # Primary style on the active material so it's clearly selected.
+            label = f"{'▸ ' if is_active else ''}{name}  ·  {count} exp"
+            if st.sidebar.button(
+                label,
+                key=f"mat_btn_{name}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state["material_picker"] = name
+                st.rerun()
     else:
-        sel = None
         st.sidebar.info("No materials registered yet.")
 
     with st.sidebar.expander("+ New material", expanded=not materials):
         _new_material_form(ws)
-    return sel
+    return st.session_state.get("material_picker")
 
 
 def _new_material_form(ws: Workspace) -> None:
@@ -207,6 +225,8 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
     df = experiments_to_frame(domain, experiments)
     by_id = {e.id: e for e in experiments}
 
+    _status_summary(domain, experiments)
+
     col_config = {
         "id": st.column_config.TextColumn(
             "id",
@@ -244,36 +264,27 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
         use_container_width=True,
     )
 
-    save_col, reload_col, lock_col, unlock_col, import_col, export_col = st.columns(
-        [1, 1, 1, 1, 2, 1]
+    # Autosave on every edit. Pure function of (edited frame, stored state);
+    # unchanged rows are skipped, locked rows honor their guard, empty rows
+    # are dropped. Errors surface as row-scoped warnings.
+    n_saved, n_deleted, save_errors = _autosave(
+        ws, material_name, domain, edited, by_id
     )
-    if save_col.button("Save sheet", key=f"save_{material_name}"):
-        try:
-            exps = frame_to_experiments(domain, edited)
-            blocked: list[str] = []
-            for exp in exps:
-                exp.validate_against(domain)
-                prev = by_id.get(exp.id)
-                if prev is not None and prev.locked and exp.locked:
-                    # Locked row: reject any value change. Allow the toggle
-                    # itself (caught by ``prev.locked and exp.locked``).
-                    if _values_changed(prev, exp):
-                        blocked.append(exp.id)
-                        continue
-                ws.store.upsert(exp)
-            if blocked:
-                st.warning(
-                    f"Skipped {len(blocked)} locked row(s) with edited values: "
-                    f"{', '.join(blocked[:5])}"
-                    f"{'…' if len(blocked) > 5 else ''}. "
-                    "Uncheck 🔒 to edit them."
-                )
-            else:
-                st.success(f"Saved {len(exps)} row(s).")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"{exc}")
+    if n_saved or n_deleted:
+        pieces = []
+        if n_saved:
+            pieces.append(f"{n_saved} saved")
+        if n_deleted:
+            pieces.append(f"{n_deleted} deleted")
+        st.toast("✓ " + " · ".join(pieces))
+    for err in save_errors[:3]:
+        st.warning(err)
+    if len(save_errors) > 3:
+        st.warning(f"…and {len(save_errors) - 3} more row(s) could not be saved")
 
+    reload_col, lock_col, unlock_col, import_col, export_col = st.columns(
+        [1, 1, 1, 2, 1]
+    )
     if reload_col.button("Reload", key=f"reload_{material_name}"):
         st.rerun()
     if lock_col.button("🔒 Lock all", key=f"lockall_{material_name}"):
@@ -607,6 +618,12 @@ def _predict_section(ws: Workspace, domain: MaterialDomain) -> None:
 
 def _suggest_section(ws: Workspace, domain: MaterialDomain) -> None:
     st.subheader("Suggest next experiments")
+    st.caption(
+        "The model proposes candidates with a predicted target **and** "
+        "uncertainty, ranked by Expected Improvement. Click **Add to sheet** "
+        "to drop a proposal into your data sheet as an un-measured row — run "
+        "the experiment and fill in the measured result to close the loop."
+    )
     if not domain.targets:
         st.info("No targets declared.")
         return
@@ -622,7 +639,14 @@ def _suggest_section(ws: Workspace, domain: MaterialDomain) -> None:
     k = c3.number_input(
         "# suggestions", min_value=1, max_value=25, value=5, key=f"sugg_k_{domain.name}"
     )
-    if st.button("Suggest", key=f"sugg_btn_{domain.name}"):
+
+    # Cache the most recent suggestions per (material, target, direction) so
+    # clicking "Add to sheet" for one row doesn't re-roll the whole set.
+    cache_key = f"sugg_cache_{domain.name}"
+    run_key = f"sugg_run_{domain.name}"
+
+    if st.button("🎯 Generate suggestions", key=f"sugg_btn_{domain.name}",
+                 type="primary"):
         try:
             fitted = fit_for_domain(domain, ws.store.iter_experiments(domain.name))
             suggestions = suggest_experiments(
@@ -630,21 +654,96 @@ def _suggest_section(ws: Workspace, domain: MaterialDomain) -> None:
                 Objective(target=target, direction=direction),  # type: ignore[arg-type]
                 n_suggestions=int(k),
             )
-            rows = []
-            for s in suggestions:
-                row = {k: v.value for k, v in s.values.items()}
-                row["_predicted_mean"] = s.predicted_mean
-                row["_predicted_std"] = s.predicted_std
-                row["_acquisition"] = s.acquisition
-                rows.append(row)
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            if fitted.n_rows < 5:
-                st.warning(
-                    "Tiny dataset — fell back to random in-bounds design. Log more "
-                    "rows and retrain for EI-based suggestions."
-                )
+            st.session_state[cache_key] = {
+                "suggestions": suggestions,
+                "target": target,
+                "direction": direction,
+                "n_rows": fitted.n_rows,
+            }
+            st.session_state[run_key] = True
         except Exception as exc:
             st.error(f"{exc}")
+            return
+
+    cached = st.session_state.get(cache_key)
+    if cached is None:
+        return
+
+    if cached["n_rows"] < 5:
+        st.warning(
+            "Tiny dataset — fell back to random in-bounds design. Log more "
+            "rows and retrain for EI-based suggestions."
+        )
+
+    target_for_cache = cached["target"]
+    dir_for_cache = cached["direction"]
+    unit = next(
+        (t.unit for t in domain.targets if t.name == target_for_cache), None
+    )
+    st.markdown(
+        f"**Predicted {target_for_cache}"
+        f"{f' ({unit})' if unit else ''}** — direction: {dir_for_cache}"
+    )
+
+    for i, s in enumerate(cached["suggestions"]):
+        with st.container(border=True):
+            left, right = st.columns([3, 1])
+            # Input values as a compact description.
+            pretty = ", ".join(
+                f"{k}={_fmt(v.value)}" for k, v in s.values.items()
+            )
+            left.markdown(f"**{pretty or '(no proposable inputs)'}**")
+            left.markdown(
+                f"Predicted: **{s.predicted_mean:.4g} ± {s.predicted_std:.3g}**"
+                f"  ·  EI = {s.acquisition:.4g}"
+            )
+            if right.button(
+                "➕ Add to sheet", key=f"add_sugg_{domain.name}_{i}",
+                type="primary",
+            ):
+                try:
+                    new_id = _add_suggestion_to_sheet(
+                        ws,
+                        domain,
+                        s.values,
+                        target_name=target_for_cache,
+                        predicted_mean=s.predicted_mean,
+                        predicted_std=s.predicted_std,
+                        direction=dir_for_cache,
+                    )
+                    st.toast(f"✓ Added {new_id}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"{exc}")
+
+    if st.button("➕ Add ALL to sheet", key=f"add_all_{domain.name}"):
+        added = 0
+        for s in cached["suggestions"]:
+            try:
+                _add_suggestion_to_sheet(
+                    ws,
+                    domain,
+                    s.values,
+                    target_name=target_for_cache,
+                    predicted_mean=s.predicted_mean,
+                    predicted_std=s.predicted_std,
+                    direction=dir_for_cache,
+                )
+                added += 1
+            except Exception:
+                continue
+        if added:
+            st.toast(f"✓ Added {added} proposals")
+            st.session_state.pop(cache_key, None)
+            st.rerun()
+
+
+def _fmt(v) -> str:
+    if isinstance(v, float):
+        return f"{v:.4g}"
+    if isinstance(v, dict):
+        return " + ".join(f"{k}{_fmt(vv)}" for k, vv in v.items())
+    return str(v)
 
 
 def _input_widget(col, spec: InputSpec, key: str):
@@ -659,7 +758,7 @@ def _input_widget(col, spec: InputSpec, key: str):
 
 
 def _values_changed(a, b) -> bool:
-    """True if the non-locked field set of experiment ``b`` differs from ``a``."""
+    """True if the value set of experiment ``b`` differs from ``a``."""
     if set(a.values.keys()) != set(b.values.keys()):
         return True
     for name, va in a.values.items():
@@ -674,6 +773,122 @@ def _set_all_locked(ws: Workspace, material_name: str, locked: bool) -> None:
         if exp.locked == locked:
             continue
         ws.store.upsert(exp.model_copy(update={"locked": locked}))
+
+
+def _autosave(
+    ws: Workspace,
+    material_name: str,
+    domain: MaterialDomain,
+    edited: pd.DataFrame,
+    by_id: dict[str, Experiment],
+) -> tuple[int, int, list[str]]:
+    """Persist any diff between ``edited`` and the stored state.
+
+    Returns ``(n_saved, n_deleted, errors)``. Rows that fail validation or
+    are locked are left untouched and reported in ``errors``.
+    """
+    errors: list[str] = []
+    try:
+        exps = frame_to_experiments(domain, edited)
+    except Exception as exc:  # pragma: no cover - defensive
+        return 0, 0, [f"could not parse sheet: {exc}"]
+
+    edited_ids: set[str] = set()
+    n_saved = 0
+    for exp in exps:
+        edited_ids.add(exp.id)
+        try:
+            exp.validate_against(domain)
+        except Exception as exc:
+            errors.append(f"row {exp.id}: {exc}")
+            continue
+        prev = by_id.get(exp.id)
+        if prev is not None:
+            # Locked-row guard: allow the toggle but refuse value edits.
+            if prev.locked and exp.locked and _values_changed(prev, exp):
+                errors.append(f"row {exp.id} is 🔒 locked — uncheck to edit")
+                continue
+            # The frame carries only ``values`` + ``locked``; preserve
+            # ``metadata`` and ``artifacts`` (e.g. suggestion origin, blob
+            # refs) from the stored row so autosave never drops them.
+            exp = exp.model_copy(
+                update={"metadata": prev.metadata, "artifacts": prev.artifacts}
+            )
+            if prev == exp:
+                continue  # bitwise-identical, skip quietly
+        ws.store.upsert(exp)
+        n_saved += 1
+
+    # Deletions: any stored row not in the edited frame is gone. Honor lock.
+    n_deleted = 0
+    for prev_id, prev in by_id.items():
+        if prev_id in edited_ids:
+            continue
+        if prev.locked:
+            errors.append(f"row {prev_id} is 🔒 locked — cannot delete")
+            continue
+        ws.store.delete(material_name, prev_id)
+        n_deleted += 1
+
+    return n_saved, n_deleted, errors
+
+
+def _status_summary(domain: MaterialDomain, experiments: list[Experiment]) -> None:
+    """Show counts of measured vs proposed vs locked rows above the sheet."""
+    n = len(experiments)
+    if n == 0:
+        st.info("No rows yet. Use **Suggest** below to generate proposals.")
+        return
+    target_names = [t.name for t in domain.targets]
+    measured = 0
+    proposed = 0
+    locked = 0
+    for e in experiments:
+        has_any_target = any(t in e.values for t in target_names)
+        if has_any_target:
+            measured += 1
+        else:
+            proposed += 1
+        if e.locked:
+            locked += 1
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total rows", n)
+    c2.metric("Measured", measured)
+    c3.metric("Proposed (awaiting results)", proposed)
+    c4.metric("Locked", locked)
+
+
+def _add_suggestion_to_sheet(
+    ws: Workspace,
+    domain: MaterialDomain,
+    suggestion_values: dict[str, InputValue],
+    target_name: str,
+    predicted_mean: float,
+    predicted_std: float,
+    direction: str,
+) -> str:
+    """Persist a suggestion as an un-measured experiment row and return its id."""
+    import uuid as _uuid
+
+    new_id = f"proposal_{_uuid.uuid4().hex[:6]}"
+    exp = Experiment(
+        id=new_id,
+        domain=domain.name,
+        values=dict(suggestion_values),
+        metadata={
+            "origin": "suggestion",
+            "predicted": {
+                target_name: {
+                    "mean": float(predicted_mean),
+                    "std": float(predicted_std),
+                    "direction": direction,
+                }
+            },
+        },
+    )
+    exp.validate_against(domain)
+    ws.store.upsert(exp)
+    return new_id
 
 
 def _css_color(hex_color: str) -> str:

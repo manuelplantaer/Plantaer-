@@ -34,19 +34,19 @@ def experiments_to_frame(
 
 
 def frame_to_experiments(
-    domain: MaterialDomain, frame: pd.DataFrame
+    domain: MaterialDomain, frame: pd.DataFrame, *, skip_empty: bool = True
 ) -> list[Experiment]:
-    """Inverse of ``experiments_to_frame``; tolerates NaN as missing."""
+    """Inverse of ``experiments_to_frame``; tolerates NaN as missing.
+
+    Totally empty rows (no id and no non-null cell) are skipped by default
+    so autosave doesn't create ghost experiments on each data_editor rerun.
+    """
     specs = _ordered_specs(domain)
     by_name = {s.name: s for s in specs}
     out: list[Experiment] = []
     for _, row in frame.iterrows():
         raw_id = row.get("id")
-        exp_id = (
-            str(raw_id)
-            if isinstance(raw_id, str) and raw_id
-            else f"exp_{uuid.uuid4().hex[:8]}"
-        )
+        has_id = isinstance(raw_id, str) and raw_id.strip()
         locked = bool(row.get(LOCK_COL, False)) if LOCK_COL in row else False
         values: dict[str, InputValue] = {}
         for name, spec in by_name.items():
@@ -60,6 +60,10 @@ def frame_to_experiments(
             values[name] = InputValue(
                 value=_coerce(raw, spec.type), unit=spec.unit
             )
+        if skip_empty and not has_id and not values and not locked:
+            # Pure placeholder row from a `num_rows="dynamic"` editor — drop.
+            continue
+        exp_id = str(raw_id).strip() if has_id else f"exp_{uuid.uuid4().hex[:8]}"
         out.append(
             Experiment(id=exp_id, domain=domain.name, values=values, locked=locked)
         )
