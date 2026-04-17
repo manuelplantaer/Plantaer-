@@ -10,4 +10,5 @@ dist/
 blobs/
 *.sqlite
 *.sqlite3
+plantaer_workspace/
 .DS_Store
