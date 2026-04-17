@@ -10,15 +10,22 @@ import pandas as pd
 from ..schema import CATEGORY_ORDER, Experiment, InputType, InputValue, MaterialDomain
 
 
+LOCK_COL = "🔒 locked"
+
+
 def experiments_to_frame(
     domain: MaterialDomain, experiments: Iterable[Experiment]
 ) -> pd.DataFrame:
-    """Produce one row per experiment; columns ordered by category then declaration."""
+    """Produce one row per experiment; columns ordered by category then declaration.
+
+    The first two columns are ``id`` (rename-safe) and ``🔒 locked`` (boolean).
+    Locked rows render un-editable at save time.
+    """
     specs = _ordered_specs(domain)
-    cols = ["id"] + [s.name for s in specs]
+    cols = ["id", LOCK_COL] + [s.name for s in specs]
     rows: list[dict] = []
     for exp in experiments:
-        row: dict = {"id": exp.id}
+        row: dict = {"id": exp.id, LOCK_COL: bool(exp.locked)}
         for s in specs:
             iv = exp.values.get(s.name)
             row[s.name] = None if iv is None else iv.value
@@ -40,6 +47,7 @@ def frame_to_experiments(
             if isinstance(raw_id, str) and raw_id
             else f"exp_{uuid.uuid4().hex[:8]}"
         )
+        locked = bool(row.get(LOCK_COL, False)) if LOCK_COL in row else False
         values: dict[str, InputValue] = {}
         for name, spec in by_name.items():
             if name not in row:
@@ -52,7 +60,9 @@ def frame_to_experiments(
             values[name] = InputValue(
                 value=_coerce(raw, spec.type), unit=spec.unit
             )
-        out.append(Experiment(id=exp_id, domain=domain.name, values=values))
+        out.append(
+            Experiment(id=exp_id, domain=domain.name, values=values, locked=locked)
+        )
     return out
 
 

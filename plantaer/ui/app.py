@@ -26,7 +26,7 @@ from ..schema import (
     MaterialDomain,
 )
 from ..workspace import Workspace
-from .tabular import experiments_to_frame, frame_to_experiments
+from .tabular import LOCK_COL, experiments_to_frame, frame_to_experiments
 
 
 WORKSPACE_ENV = "PLANTAER_WORKSPACE"
@@ -205,8 +205,21 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
 
     experiments = list(ws.store.iter_experiments(material_name))
     df = experiments_to_frame(domain, experiments)
+    by_id = {e.id: e for e in experiments}
 
-    col_config = {"id": st.column_config.TextColumn("id", help="experiment id")}
+    col_config = {
+        "id": st.column_config.TextColumn(
+            "id",
+            help="experiment id — edit to rename",
+        ),
+        LOCK_COL: st.column_config.CheckboxColumn(
+            LOCK_COL,
+            help=(
+                "Toggle to finalize or re-open a row. Locked rows cannot have "
+                "their values changed on save — uncheck to edit."
+            ),
+        ),
+    }
     for s in domain.all_specs():
         header = f"[{s.category.value}] {s.name}" + (f" ({s.unit})" if s.unit else "")
         if s.type == InputType.NUMERIC:
@@ -224,24 +237,76 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
             col_config[s.name] = st.column_config.TextColumn(header)
 
     edited = st.data_editor(
-        df, num_rows="dynamic", column_config=col_config, key=f"editor_{material_name}",
+        df,
+        num_rows="dynamic",
+        column_config=col_config,
+        key=f"editor_{material_name}",
         use_container_width=True,
     )
 
-    save_col, reload_col, import_col, export_col = st.columns([1, 1, 2, 1])
+    save_col, reload_col, lock_col, unlock_col, import_col, export_col = st.columns(
+        [1, 1, 1, 1, 2, 1]
+    )
     if save_col.button("Save sheet", key=f"save_{material_name}"):
         try:
             exps = frame_to_experiments(domain, edited)
+            blocked: list[str] = []
             for exp in exps:
                 exp.validate_against(domain)
+                prev = by_id.get(exp.id)
+                if prev is not None and prev.locked and exp.locked:
+                    # Locked row: reject any value change. Allow the toggle
+                    # itself (caught by ``prev.locked and exp.locked``).
+                    if _values_changed(prev, exp):
+                        blocked.append(exp.id)
+                        continue
                 ws.store.upsert(exp)
-            st.success(f"Saved {len(exps)} row(s).")
+            if blocked:
+                st.warning(
+                    f"Skipped {len(blocked)} locked row(s) with edited values: "
+                    f"{', '.join(blocked[:5])}"
+                    f"{'…' if len(blocked) > 5 else ''}. "
+                    "Uncheck 🔒 to edit them."
+                )
+            else:
+                st.success(f"Saved {len(exps)} row(s).")
             st.rerun()
         except Exception as exc:
             st.error(f"{exc}")
 
     if reload_col.button("Reload", key=f"reload_{material_name}"):
         st.rerun()
+    if lock_col.button("🔒 Lock all", key=f"lockall_{material_name}"):
+        _set_all_locked(ws, material_name, True)
+        st.rerun()
+    if unlock_col.button("🔓 Unlock all", key=f"unlockall_{material_name}"):
+        _set_all_locked(ws, material_name, False)
+        st.rerun()
+
+    with st.expander("Rename a row id"):
+        if experiments:
+            rid_c1, rid_c2, rid_c3 = st.columns([2, 2, 1])
+            old_id = rid_c1.selectbox(
+                "current id",
+                [e.id for e in experiments],
+                key=f"rn_row_old_{material_name}",
+                label_visibility="collapsed",
+            )
+            new_id = rid_c2.text_input(
+                "new id",
+                key=f"rn_row_new_{material_name}",
+                label_visibility="collapsed",
+                placeholder="new id",
+            )
+            if rid_c3.button("Rename row", key=f"rn_row_btn_{material_name}"):
+                try:
+                    ws.rename_experiment(material_name, old_id, new_id)
+                    st.success(f"Renamed {old_id!r} → {new_id!r}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"{exc}")
+        else:
+            st.caption("No rows yet.")
 
     with import_col.expander("Import CSV"):
         uploaded = st.file_uploader(
@@ -281,6 +346,26 @@ def _sheet_page(ws: Workspace, material_name: str) -> None:
 
 
 def _schema_editor(ws: Workspace, domain: MaterialDomain) -> None:
+    # --- rename the material itself -----------------------------------
+    st.markdown("**Material name**")
+    rn_col, rn_btn = st.columns([4, 1])
+    new_mat = rn_col.text_input(
+        "rename material",
+        value=domain.name,
+        key=f"rn_mat_{domain.name}",
+        label_visibility="collapsed",
+    )
+    if rn_btn.button("Rename", key=f"rn_mat_btn_{domain.name}"):
+        try:
+            ws.rename_material(domain.name, new_mat)
+            st.success(f"Renamed to {new_mat!r}")
+            # Re-point the sidebar selection so the user stays on the same sheet.
+            st.session_state["material_picker"] = new_mat
+            st.rerun()
+        except Exception as exc:
+            st.error(f"{exc}")
+
+    st.divider()
     st.caption("Declared columns for this material.")
     rows = [
         {
@@ -297,6 +382,29 @@ def _schema_editor(ws: Workspace, domain: MaterialDomain) -> None:
         for s in domain.all_specs()
     ]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("**Rename a column**")
+    rc1, rc2, rc3 = st.columns([2, 2, 1])
+    col_names = [s.name for s in domain.all_specs()]
+    old_col = rc1.selectbox(
+        "existing",
+        col_names,
+        key=f"rn_col_old_{domain.name}",
+        label_visibility="collapsed",
+    )
+    new_col = rc2.text_input(
+        "new name",
+        key=f"rn_col_new_{domain.name}",
+        label_visibility="collapsed",
+        placeholder="new name",
+    )
+    if rc3.button("Rename column", key=f"rn_col_btn_{domain.name}"):
+        try:
+            ws.rename_column(domain.name, old_col, new_col)
+            st.success(f"Renamed {old_col!r} → {new_col!r}")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"{exc}")
 
     st.markdown("**Add a column**")
     with st.form(f"add_col_{domain.name}"):
@@ -548,6 +656,24 @@ def _input_widget(col, spec: InputSpec, key: str):
         return col.selectbox(spec.name, spec.choices, key=key)
     val = col.text_input(spec.name, key=key)
     return val or None
+
+
+def _values_changed(a, b) -> bool:
+    """True if the non-locked field set of experiment ``b`` differs from ``a``."""
+    if set(a.values.keys()) != set(b.values.keys()):
+        return True
+    for name, va in a.values.items():
+        vb = b.values[name]
+        if va.value != vb.value or va.unit != vb.unit:
+            return True
+    return False
+
+
+def _set_all_locked(ws: Workspace, material_name: str, locked: bool) -> None:
+    for exp in list(ws.store.iter_experiments(material_name)):
+        if exp.locked == locked:
+            continue
+        ws.store.upsert(exp.model_copy(update={"locked": locked}))
 
 
 def _css_color(hex_color: str) -> str:

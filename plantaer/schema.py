@@ -125,6 +125,9 @@ class Experiment(BaseModel):
     values: dict[str, InputValue] = Field(default_factory=dict)
     artifacts: dict[str, Path] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # When True, the row is considered a finalized result — UI refuses to
+    # overwrite its values until the lock is released.
+    locked: bool = False
 
     def validate_against(self, domain: MaterialDomain) -> None:
         """Raise if this experiment does not satisfy the domain's schema."""

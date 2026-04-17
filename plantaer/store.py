@@ -23,11 +23,22 @@ CREATE TABLE IF NOT EXISTS experiments (
     values_json TEXT NOT NULL,
     artifacts_json TEXT NOT NULL,
     metadata_json TEXT NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (domain, id)
 );
 CREATE INDEX IF NOT EXISTS ix_experiments_domain ON experiments(domain);
 """
+
+
+def _ensure_locked_column(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(experiments)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "locked" not in cols:
+        conn.execute(
+            "ALTER TABLE experiments ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 class ExperimentStore:
@@ -38,6 +49,7 @@ class ExperimentStore:
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        _ensure_locked_column(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -53,13 +65,21 @@ class ExperimentStore:
         )
         metadata_json = json.dumps(exp.metadata, default=_json_default)
         self._conn.execute(
-            "INSERT INTO experiments(id, domain, values_json, artifacts_json, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO experiments(id, domain, values_json, artifacts_json, metadata_json, locked) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(domain, id) DO UPDATE SET "
             "values_json=excluded.values_json, "
             "artifacts_json=excluded.artifacts_json, "
-            "metadata_json=excluded.metadata_json",
-            (exp.id, exp.domain, values_json, artifacts_json, metadata_json),
+            "metadata_json=excluded.metadata_json, "
+            "locked=excluded.locked",
+            (
+                exp.id,
+                exp.domain,
+                values_json,
+                artifacts_json,
+                metadata_json,
+                1 if exp.locked else 0,
+            ),
         )
         self._conn.commit()
 
@@ -82,7 +102,7 @@ class ExperimentStore:
 
     def iter_experiments(self, domain: str) -> Iterable[Experiment]:
         cur = self._conn.execute(
-            "SELECT id, domain, values_json, artifacts_json, metadata_json "
+            "SELECT id, domain, values_json, artifacts_json, metadata_json, locked "
             "FROM experiments WHERE domain = ? ORDER BY created_at",
             (domain,),
         )
@@ -91,7 +111,7 @@ class ExperimentStore:
 
     def get(self, domain: str, exp_id: str) -> Experiment:
         cur = self._conn.execute(
-            "SELECT id, domain, values_json, artifacts_json, metadata_json "
+            "SELECT id, domain, values_json, artifacts_json, metadata_json, locked "
             "FROM experiments WHERE domain = ? AND id = ?",
             (domain, exp_id),
         )
@@ -99,6 +119,24 @@ class ExperimentStore:
         if row is None:
             raise KeyError(f"{domain}/{exp_id} not found")
         return _row_to_experiment(row)
+
+    def rename_domain(self, old: str, new: str) -> None:
+        """Move every experiment from ``old`` to ``new`` in one transaction."""
+        if old == new:
+            return
+        self._conn.execute(
+            "UPDATE experiments SET domain = ? WHERE domain = ?", (new, old)
+        )
+        self._conn.commit()
+
+    def rename_id(self, domain: str, old_id: str, new_id: str) -> None:
+        if old_id == new_id:
+            return
+        self._conn.execute(
+            "UPDATE experiments SET id = ? WHERE domain = ? AND id = ?",
+            (new_id, domain, old_id),
+        )
+        self._conn.commit()
 
     def delete(self, domain: str, exp_id: str) -> None:
         self._conn.execute(
@@ -114,13 +152,18 @@ class ExperimentStore:
 
 
 def _row_to_experiment(row: tuple) -> Experiment:
-    exp_id, domain, v_json, a_json, m_json = row
+    exp_id, domain, v_json, a_json, m_json, locked = row
     values_raw = json.loads(v_json)
     values = {k: InputValue.model_validate(body) for k, body in values_raw.items()}
     artifacts = {k: Path(v) for k, v in json.loads(a_json).items()}
     metadata = json.loads(m_json)
     return Experiment(
-        id=exp_id, domain=domain, values=values, artifacts=artifacts, metadata=metadata
+        id=exp_id,
+        domain=domain,
+        values=values,
+        artifacts=artifacts,
+        metadata=metadata,
+        locked=bool(locked),
     )
 
 
