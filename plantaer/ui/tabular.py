@@ -7,6 +7,7 @@ from typing import Iterable
 
 import pandas as pd
 
+from ..featurize.composition import dict_to_formula
 from ..schema import CATEGORY_ORDER, Experiment, InputType, InputValue, MaterialDomain
 
 
@@ -28,7 +29,16 @@ def experiments_to_frame(
         row: dict = {"id": exp.id, LOCK_COL: bool(exp.locked)}
         for s in specs:
             iv = exp.values.get(s.name)
-            row[s.name] = None if iv is None else iv.value
+            if iv is None:
+                row[s.name] = None
+                continue
+            v = iv.value
+            # Compositions render as canonical chemical-formula strings so
+            # Streamlit's data_editor doesn't ``str()``-ify the dict into
+            # "{'Fe': 0.6, 'Ni': 0.4}" and poison the round-trip.
+            if s.type == InputType.COMPOSITION and isinstance(v, dict):
+                v = dict_to_formula(v)
+            row[s.name] = v
         rows.append(row)
     return pd.DataFrame(rows, columns=cols)
 
@@ -76,9 +86,13 @@ def _coerce(raw, t: InputType):
     if t == InputType.CATEGORICAL:
         return str(raw)
     if t == InputType.COMPOSITION:
+        # Compositions are stored as whatever the user / featurizer pass
+        # through — dict OR formula string. Strings like
+        # "Fe0.5Ni0.5" and "{'Fe': 0.5, 'Ni': 0.5}" both work because the
+        # featurizer self-heals both forms.
         if isinstance(raw, dict):
             return raw
-        return str(raw)
+        return str(raw).strip()
     return str(raw)
 
 

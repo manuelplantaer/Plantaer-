@@ -76,8 +76,41 @@ def as_element_dict(value: Any) -> dict[str, float]:
                 raise ValueError(f"unknown element {sym!r}")
         return {k: float(v) for k, v in value.items()}
     if isinstance(value, str):
-        return parse_formula(value)
+        s = value.strip()
+        # Self-heal Python-dict-repr strings like "{'Fe': 0.6, 'Ni': 0.4}" that
+        # may have been produced by st.data_editor str()-ifying dict cells.
+        if s.startswith("{") and s.endswith("}"):
+            import ast
+
+            try:
+                parsed = ast.literal_eval(s)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError(f"could not parse composition {value!r}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"composition string {value!r} is not a dict")
+            return as_element_dict(parsed)
+        return parse_formula(s)
     raise TypeError(f"composition must be str or dict, got {type(value).__name__}")
+
+
+def dict_to_formula(elems: dict[str, float]) -> str:
+    """Render an element->count dict as a compact chemical formula.
+
+    Used at the DataFrame boundary so Streamlit's data_editor shows
+    "Fe0.61Ni0.39" instead of a Python-dict repr it would corrupt.
+    Elements with integer counts drop the count (Fe2O3, not Fe2.0O3.0).
+    """
+    parts: list[str] = []
+    for sym, count in elems.items():
+        if sym not in _SYMBOL_TO_Z:
+            raise ValueError(f"unknown element {sym!r}")
+        n = float(count)
+        if n == int(n):
+            suffix = "" if int(n) == 1 else str(int(n))
+        else:
+            suffix = f"{n:g}"
+        parts.append(f"{sym}{suffix}")
+    return "".join(parts)
 
 
 def composition_feature_names(prefix: str) -> list[str]:
@@ -110,6 +143,7 @@ __all__ = [
     "N_ELEMENTS",
     "parse_formula",
     "as_element_dict",
+    "dict_to_formula",
     "composition_feature_names",
     "featurize_composition",
 ]
